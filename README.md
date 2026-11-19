@@ -1,35 +1,57 @@
-# PS Remote Play Relay
+# PS Bitrate Relay
 
-在 PS5 所在家庭网络的 Mac mini 上运行一个进程，为官方 PS Remote Play 客户端修改 IPv4 UDP/9296 握手里的 LaunchSpec 码率。当前适配已经捕获并验证过的 macOS Remote Play 9.5.0、Takion v20、1756 或 1760 字节 Base64 布局，默认把请求从 15 Mbps 改为 40 Mbps。实际编码目标以 PS5 回报为准，视频吞吐另计。
+Run the relay on a Mac mini on the PS5's home network. It rewrites IPv4 UDP/9296 handshakes from macOS PS Remote Play and local PlayStation Portal clients. The PS5 reports the actual encoder target.
 
-- 家中客户端与 PS5 同网段。填写 `lan_clients` 中每台客户端的固定 IPv4 地址和当前网卡 MAC。Mini 定向通告 ARP，接收这些客户端发往 PS5 的 IPv4 报文。PS5 发回客户端的视频仍走原来的二层路径。PS5 保持现有接线。
-- 外网客户端通过**原生 Tailscale** 使用 Mini 广播的 PS5 子网路由。客户端需要允许接收该路由，并能访问 PS5 私网地址。当前实现匹配 Mini 向 PS5 发出的、源地址为 `mini_ip` 的流量，也就是已验证的 macOS Tailscale 子网转发形态。通过 PSN 公网打洞、非 SNAT 路由和 IPv6 不在当前适配范围。
+- Local clients must share an IPv4 subnet with the PS5. Register Macs under `[[clients.remote_play]]` and Portals under `[[clients.portal]]`. Enter each device's fixed IPv4 address and the MAC address of its active network interface. Both groups share a limit of 32 devices. The Mac mini sends targeted ARP announcements to receive the IPv4 packets these clients send to the PS5. Video from the PS5 follows the original Layer 2 path back to the client. For a Tailscale-only setup, you can omit the entire `clients` section.
+- Remote Macs use native Tailscale to reach the PS5 through a subnet route advertised by the Mac mini. The relay matches traffic that the Mini forwards to the PS5 with `host_ip` as the source address and uses `default_bitrate`. Because remote clients share the Mini's source address, the relay applies the same bitrate to all of them.
 
-服务需要 Mini 的有线网口、同一 IPv4 子网里的 PS5，以及 root 权限。程序用一个独立 PF anchor 拦截，停止时移除自己的规则并恢复已登记客户端的 ARP。系统仍需允许 Mini 和客户端直接交换局域网报文。登记 Wi-Fi 客户端时应使用它在该 Wi-Fi 网络上的实际 MAC。部署前断开当前串流，重新连接才会发送新的启动握手。
+`default_bitrate` and per-device `bitrate` values are in kbps. Devices inherit `default_bitrate` when their `bitrate` is omitted. Mac and Tailscale connections accept integers from `10000` to `99999`, excluding `15000`. Portal accepts integers from `10000` to `99999` and multiples of `1000` from `100000` to `200000`. The `200000` setting is experimental.
+
+Under `[[clients.portal]]`, you can set `bitrate = 80000` or `bitrate = 125000`. The relay encodes `125000` as the five-byte JSON number `125e3`. Configuration validation rejects `123456` because its exact representation requires more than five bytes. Test new bitrate settings on a Portal to see which values it accepts.
+
+## Handshake Matching and Rewriting
+
+1. The relay inspects IPv4 UDP packets destined for port `9296` on the PS5 when they come from a registered LAN client or are forwarded through Tailscale with `host_ip` as the source address.
+2. It checks the initial Takion header, the zero GMAC, and the BIG message prefix, and requires `client_version == 20`. It then parses the length-delimited protobuf field 3 (`launch_spec`) in `BigPayload` and checks the field boundaries.
+3. The total Base64 length of LaunchSpec can vary. The eight Base64 characters covering decoded offsets `334–338` must all be present in the field within the current UDP datagram and decode to six bytes. The relay rewrites that portion of the ciphertext and recomputes the UDP checksum. If the window is absent or invalid, it forwards the original UDP payload. [Matching and rewrite code](ps_bitrate_relay/wire.py)
+4. The XOR mask depends on the client type. The Mac and Tailscale paths assume an original value of `15000` kbps, and the Portal path assumes `25000` kbps. The rewrite also assumes that ciphertext offset `334` corresponds to the plaintext `bwKbpsSent` field. If a client moves the field or changes its original value, the packet can still match and be rewritten incorrectly.
+
+### How Related Projects Handle Bitrate
+
+- **Chiaki-ng** is a streaming client. It reads the bitrate from its video settings and writes it to `bwKbpsSent` in LaunchSpec before encryption. It then Base64-encodes the ciphertext and adds it to the BIG message. PS5 streaming uses Takion v12. The Senkusha network test uses a v9 BIG with an empty `launch_spec`. The client generates both messages directly. [Streaming protocol version](https://github.com/streetpea/chiaki-ng/blob/main/lib/src/streamconnection.c#L134-L155) · [Streaming BIG](https://github.com/streetpea/chiaki-ng/blob/main/lib/src/streamconnection.c#L925-L1035) · [Network test BIG](https://github.com/streetpea/chiaki-ng/blob/main/lib/src/senkusha.c#L745-L770)
+- **The original `ps5-portal-high-bitrate`** is a network relay for the Portal. It filters unfragmented IPv4 packets from the configured Portal to the PS5 on UDP port `9296` and checks the initial Takion header, zero GMAC, v20 BIG, and `launch_spec` field. It requires a declared field length of exactly `2296` Base64 characters before applying XOR to the portion of ciphertext containing offset `334`. [Original matching and rewrite code](https://github.com/atameric/ps5-portal-high-bitrate/blob/main/portal_active_probe.py#L18-L74) · [Observed Portal results](https://github.com/atameric/ps5-portal-high-bitrate#observed-results)
+
+## Validation and Installation
+
+The service requires Python 3.11 or newer, an Ethernet interface on the Mac mini, a PS5 on the same IPv4 subnet, and root privileges. Copy the [TOML example](config.example.toml), adjust it for your network, and replace or remove the sample Portal entry.
+
+Set the console's `ip` and `mac` under `[ps5]`.
 
 ```fish
-cp config.example.json config.json
-uv sync --locked
-uv run --locked python -m unittest discover -s tests -v
-sudo /usr/bin/python3 -E -s -B -m psrp --config config.json --check
-sudo /usr/bin/python3 -E -s -B -m psrp --config config.json --seconds 90
+cp config.example.toml config.toml
+uv sync --python 3.11 --locked
+uv run --python 3.11 --locked python -m unittest discover -s tests -v
 ```
 
-`target_kbps` 支持五位十进制整数 `10000–99999`，排除原值 `15000`。当前使用同长度的 XOR 改写，其他码率能否被 PS5 接受需要分别测试。只使用 Tailscale 时把 `lan_clients` 设成空对象。
-
-限时测试后，可安装为随 Mini 启动的系统服务。安装器把运行代码和配置复制到 root 所有的目录。项目由 uv 管理，目前无第三方依赖，所以常驻进程使用系统 Python。
+The service defaults to `/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11` from the python.org macOS installer. If the Mac mini uses a different system-level installation of Python 3.11 or newer, set `relay_python` below to its absolute path. The installer checks the Python version, validates the setup with that interpreter, and writes the same path into the LaunchDaemon.
 
 ```fish
-sudo /bin/sh deploy/install.sh config.json
-sudo launchctl print system/local.ps-remote-play-relay
-tail -f /Library/Logs/PSRemotePlayRelay/relay.log
+set -l relay_python /Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11
+"$relay_python" --version
+sudo "$relay_python" -E -s -B -m ps_bitrate_relay --config config.toml --check
+sudo /bin/sh deploy/install.sh config.toml "$relay_python"
+sudo launchctl print system/local.ps-bitrate-relay
+tail -f /Library/Logs/PSBitrateRelay/relay.log
 ```
 
-`held_big` 表示接管了启动握手，`patched_egress` 表示独立的网口捕获看到了改写后的报文，`ps5_target` 是 PS5 回报的编码目标。局域网视频回程通常绕过 Mini，需在客户端抓包才能独立读取其 PS5 回报。
+`--check` validates the configuration, routing, PF, and packet capture interfaces. Reconnect Remote Play after installation. The `patched` log entry shows the client type and the requested bitrate for the session. On the LAN, video usually bypasses the Mac mini on its way back to the client. Capture packets on the client to verify the encoder target reported by the PS5 for that session.
 
-停用服务并恢复网络时运行以下命令。调整配置后可再次加载同一个 plist。已安装的配置位于 `/Library/Application Support/PSRemotePlayRelay/config.json`。
+## Reloading the Service
+
+The installed configuration is at `/Library/Application Support/PSBitrateRelay/config.toml`. After editing it, run `--check` from the installation directory with the service's Python interpreter. Then unload and reload the LaunchDaemon and start a new streaming session.
 
 ```fish
-sudo launchctl bootout system/local.ps-remote-play-relay
-sudo launchctl bootstrap system /Library/LaunchDaemons/local.ps-remote-play-relay.plist
+sudo /bin/sh -c 'cd "/Library/Application Support/PSBitrateRelay" && exec "$1" -E -s -B -m ps_bitrate_relay --config config.toml --check' sh "$relay_python"; and \
+    sudo launchctl bootout system/local.ps-bitrate-relay; and \
+    sudo launchctl bootstrap system /Library/LaunchDaemons/local.ps-bitrate-relay.plist
 ```

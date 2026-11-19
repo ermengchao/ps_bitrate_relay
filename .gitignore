@@ -2,5 +2,4 @@
 __pycache__/
 *.pyz
 config.toml
-config.json
 .tools/

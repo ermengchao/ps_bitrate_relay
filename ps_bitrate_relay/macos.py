@@ -7,7 +7,7 @@ import subprocess
 
 
 PF = "/sbin/pfctl"
-ANCHOR = "com.apple/000.psrp-relay"
+ANCHOR = "com.apple/000.ps-bitrate-relay"
 
 
 def command(*args, check=True, data=None):
@@ -36,11 +36,11 @@ class Link:
 def check_link(interface, mini, ps5):
     route = command("/sbin/route", "-n", "get", str(ps5)).stdout
     if not re.search(r"interface:\s+" + interface + r"\b", route) or re.search(r"flags:.*GATEWAY", route):
-        raise RuntimeError("PS5 must be on the selected, directly connected interface")
+        raise RuntimeError(f"ps5.ip: {ps5} must be directly connected on {interface}")
     info = command("/sbin/ifconfig", interface).stdout
     address = re.search(r"\binet " + re.escape(str(mini)) + r" netmask (0x[0-9a-f]+)\b", info)
     if not address or "status: active" not in info:
-        raise RuntimeError("configured Mini address is not active on the LAN interface")
+        raise RuntimeError(f"host_ip: {mini} is not active on {interface}")
     netmask = ipaddress.IPv4Address(int(address[1], 16))
     subnet = ipaddress.IPv4Network(f"{mini}/{netmask}", strict=False)
     own = mac(re.search(r"\bether ([0-9a-f:]+)", info)[1])
@@ -59,7 +59,8 @@ def verify_ps5(interface, mini, ps5, expected):
         command("/sbin/ping", "-S", str(mini), "-c", "1", "-W", "1000", str(ps5), check=False)
         found = lookup()
     if found != expected:
-        raise RuntimeError("could not verify PS5 Ethernet address; wake the PS5 or check ps5_mac")
+        raise RuntimeError(f"ps5.mac: could not verify the Ethernet address of PS5 {ps5}; "
+                           "wake the PS5 or check the configured MAC")
 
 
 def rules(interface, mini, ps5, clients):

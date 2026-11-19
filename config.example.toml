@@ -1,0 +1,17 @@
+interface = "en0"
+host_ip = "10.10.10.16"
+default_bitrate = 40000
+
+[ps5]
+ip = "10.10.10.65"
+mac = "c8:4a:a0:44:a3:bf"
+
+[[clients.remote_play]]
+ip = "10.10.10.213"
+mac = "00:e0:4c:68:00:0e"
+# Omit bitrate to inherit default_bitrate.
+
+[[clients.portal]]
+ip = "10.10.10.214"       # Example address
+mac = "02:00:00:00:00:01" # Example MAC
+bitrate = 65000

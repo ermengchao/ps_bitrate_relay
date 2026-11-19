@@ -5,9 +5,24 @@ from ipaddress import IPv4Address
 import struct
 
 STREAM_PORT = 9296
-ORIGINAL = 15000
+REMOTE_PLAY_ORIGINAL = 15000
+PORTAL_ORIGINAL = 25000
 OFFSET = 334
-LAYOUTS = {1756, 1760}
+
+
+def portal_bitrate_bytes(target):
+    """Encode a Portal target in the five bytes occupied by the original value."""
+    if type(target) is not int or not 10000 <= target <= 200000:
+        return None
+    if target < 100000:
+        return str(target).encode()
+    # Keep the original profiles' spelling for 100 and 200 Mbps.
+    if target in (100000, 200000):
+        return f"{target // 100000}e+05".encode()
+    mantissa, remainder = divmod(target, 1000)
+    if remainder == 0:
+        return f"{mantissa}e3".encode()
+    return None
 
 
 def varint(data, pos):
@@ -48,7 +63,7 @@ def fields(data):
     return result
 
 
-def patch_big(data, target, layouts=LAYOUTS):
+def patch_big(data, target, *, portal=False):
     if (len(data) < 32 or data[0] or data[13] or data[14] not in (0, 1)
             or any(data[5:9]) or any(data[21:26])
             or data[26:29] != b"\x08\x00\x12"
@@ -61,6 +76,11 @@ def patch_big(data, target, layouts=LAYOUTS):
         version, pos = varint(data, pos)
         if tag != 8 or version != 20:
             return None
+        # Portal's upstream profile assumes a 25 Mbps value at the same offset.
+        original = str(PORTAL_ORIGINAL if portal else REMOTE_PLAY_ORIGINAL).encode()
+        replacement = portal_bitrate_bytes(target) if portal else str(target).encode()
+        if replacement is None or len(replacement) != len(original):
+            return None
         # The first Takion datagram can end before its protobuf message.
         # The bitrate window must be present entirely in that datagram.
         while pos < min(end, len(data)):
@@ -69,15 +89,15 @@ def patch_big(data, target, layouts=LAYOUTS):
             if tag & 7 != 2 or pos + size > end:
                 return None
             if tag >> 3 == 3:
-                if size not in layouts:
-                    return None
                 lo = OFFSET // 3 * 3
-                hi = (OFFSET + 7) // 3 * 3
+                hi = (OFFSET + len(original) + 2) // 3 * 3
                 left, right = pos + lo // 3 * 4, pos + hi // 3 * 4
                 if right > min(pos + size, len(data)):
                     return None
                 decoded = bytearray(base64.b64decode(data[left:right], validate=True))
-                for i, (old, new) in enumerate(zip(str(ORIGINAL).encode(), str(target).encode())):
+                if len(decoded) != hi - lo:
+                    return None
+                for i, (old, new) in enumerate(zip(original, replacement)):
                     decoded[OFFSET - lo + i] ^= old ^ new
                 return data[:left] + base64.b64encode(decoded) + data[right:], size
             pos += size

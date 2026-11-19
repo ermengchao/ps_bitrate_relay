@@ -19,6 +19,7 @@ import sys
 import time
 
 from . import macos, wire
+from .config import Config
 
 RUNTIME = Path("/var/run/ps-remote-play-relay")
 RECOVERY = RUNTIME / "recovery.json"
@@ -29,33 +30,6 @@ def log(event, **details):
     print(json.dumps({"event": event, **details}), flush=True)
 
 
-@dataclass(frozen=True)
-class Config:
-    interface: str
-    mini: IPv4Address
-    ps5: IPv4Address
-    ps5_mac: bytes
-    target: int
-    clients: dict
-
-    @classmethod
-    def load(cls, path):
-        data = json.loads(path.read_text())
-        interface = data["interface"]
-        if not isinstance(interface, str) or not re.fullmatch(r"en\d+", interface):
-            raise ValueError("interface must be an Ethernet enN interface")
-        mini, ps5 = IPv4Address(data["mini_ip"]), IPv4Address(data["ps5_ip"])
-        target = data["target_kbps"]
-        if type(target) is not int or not 10000 <= target <= 99999 or target == wire.ORIGINAL:
-            raise ValueError("target_kbps must be 10000..99999 and different from 15000")
-        clients = {IPv4Address(ip): macos.mac(mac) for ip, mac in data.get("lan_clients", {}).items()}
-        peer = macos.mac(data["ps5_mac"])
-        if (mini == ps5 or mini in clients or ps5 in clients or len(clients) > 32
-                or peer in clients.values() or len(set(clients.values())) != len(clients)):
-            raise ValueError("expected distinct client and gateway addresses, with at most 32 LAN clients")
-        return cls(interface, mini, ps5, peer, target, clients)
-
-
 @dataclass
 class Session:
     startup: wire.IPv4
@@ -64,6 +38,8 @@ class Session:
     release_at: float
     last_seen: float
     ingress: str
+    client_type: str
+    target: int
     released: bool = False
     accepted: bool = False
     streaming: bool = False
@@ -109,7 +85,7 @@ class Relay:
         if not session.released:
             session.released = True
             log("patched", ingress=session.ingress, client=str(packet.src), client_port=port,
-                target_kbps=self.config.target, launchspec_bytes=session.layout)
+                client_type=session.client_type, target_kbps=session.target, launchspec_bytes=session.layout)
 
     def incoming(self, packet, now):
         if packet.dst != self.config.ps5:
@@ -130,7 +106,9 @@ class Relay:
                 self.send(part)
             return
         port, _, payload = udp
-        patch = wire.patch_big(payload, self.config.target)
+        portal = ingress == "lan" and packet.src in self.config.portals
+        target = self.config.bitrates.get(packet.src, self.config.default_bitrate)
+        patch = wire.patch_big(payload, target, portal=portal)
         if patch is None:
             if ingress == "tailnet" and len(originals) == 1:
                 self.send(packet.with_udp(payload))
@@ -141,15 +119,18 @@ class Relay:
         key = (packet.src, port)
         session = self.sessions.get(key)
         if session is None or session.startup.payload[8:] != payload:
-            session = Session(packet, *patch, now + self.hold, now, ingress)
+            session = Session(packet, *patch, now + self.hold, now, ingress,
+                              "portal" if portal else "mac", target)
             self.sessions[key] = session
-            log("held_big", ingress=ingress, client=str(packet.src), client_port=port,
-                launchspec_bytes=session.layout)
+            if self.drop or not portal:
+                log("held_big", ingress=ingress, client=str(packet.src), client_port=port,
+                    launchspec_bytes=session.layout)
         session.last_seen = now
         self.sessions.move_to_end(key)
         if len(self.sessions) > 64:
             self.sessions.popitem(last=False)
-        if session.released:
+        # Forward a Portal BIG before any Takion continuation from the same batch.
+        if session.released or (portal and not self.drop):
             self.emit(session, packet, port)
 
     def tick(self, now):
@@ -249,6 +230,9 @@ def save_recovery(state):
 
 
 def restore(state):
+    if state.get("anchor") != macos.ANCHOR:
+        log("restored", success=False, errors=["PF anchor in recovery file does not match the current relay"])
+        return False
     errors = []
     try:
         if state["armed"] and state["clients"]:
@@ -308,10 +292,15 @@ def open_lock():
 def run(args):
     config = Config.load(args.config)
     link = macos.check_link(config.interface, config.mini, config.ps5)
-    if any(ip not in link.subnet for ip in (config.ps5, *config.clients)):
-        raise RuntimeError("PS5 and enrolled clients must be on the Mini's Ethernet subnet")
-    if link.own in (config.ps5_mac, *config.clients.values()):
-        raise RuntimeError("PS5 and client MACs must differ from Mini's")
+    if config.ps5 not in link.subnet:
+        raise RuntimeError(f"ps5.ip: {config.ps5} must be on {link.subnet}")
+    if config.ps5_mac == link.own:
+        raise RuntimeError("ps5.mac: duplicates the host interface MAC")
+    for ip, mac in config.clients.items():
+        if ip not in link.subnet:
+            raise RuntimeError(f"client {ip}: ip must be on {link.subnet}")
+        if mac == link.own:
+            raise RuntimeError(f"client {ip}: mac duplicates the host interface MAC")
     rule_text = macos.rules(config.interface, config.mini, config.ps5, config.clients)
     lan_filter, loop_filter, witness_filter = filters(config, link.own)
     with ExitStack() as stack:
@@ -326,7 +315,8 @@ def run(args):
         witness = stack.enter_context(macos.Pcap(config.interface, witness_filter))
         tx = stack.enter_context(macos.Pcap(config.interface, "ether proto 0x0000"))
         if args.check:
-            log("check_ok", interface=config.interface, lan_clients=len(config.clients))
+            log("check_ok", interface=config.interface, lan_clients=len(config.clients),
+                portal_clients=len(config.portals))
             return 0
         if macos.command(macos.PF, "-a", macos.ANCHOR, "-s", "rules").stdout.strip():
             raise RuntimeError("the relay PF anchor is already in use")
@@ -335,9 +325,9 @@ def run(args):
 
         state = {"interface": config.interface, "ps5": str(config.ps5), "ps5_mac": config.ps5_mac.hex(),
                  "own": link.own.hex(), "clients": {str(ip): mac.hex() for ip, mac in config.clients.items()},
-                 "token": None, "armed": False}
+                 "anchor": macos.ANCHOR, "token": None, "armed": False}
         save_recovery(state)
-        guard = subprocess.Popen([sys.executable, "-E", "-s", "-B", "-m", "psrp", "--guardian"],
+        guard = subprocess.Popen([sys.executable, "-E", "-s", "-B", "-m", "ps_bitrate_relay", "--guardian"],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                                  start_new_session=True, pass_fds=(lock.fileno(),))
         stopping = False
@@ -369,7 +359,7 @@ def run(args):
             state["armed"] = bool(lan)
             save_recovery(state)
             log("ready", interface=config.interface, ps5=str(config.ps5), lan_clients=len(config.clients),
-                target_kbps=config.target, drop_big=args.drop_big)
+                target_kbps=config.default_bitrate, portal_clients=len(config.portals), drop_big=args.drop_big)
             while not stopping and time.monotonic() < deadline:
                 if guard.poll() is not None:
                     raise RuntimeError("recovery process stopped unexpectedly")
@@ -392,7 +382,7 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("config.json"))
+    parser.add_argument("--config", type=Path, default=Path("config.toml"), help="TOML configuration file")
     parser.add_argument("--check", action="store_true", help="validate route, PF and capture before activation")
     parser.add_argument("--seconds", type=int, default=0, help="stop and restore after this many seconds")
     parser.add_argument("--hold-seconds", type=float, default=.5)

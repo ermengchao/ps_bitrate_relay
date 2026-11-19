@@ -3,19 +3,19 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>local.ps-remote-play-relay</string>
+    <string>local.ps-bitrate-relay</string>
     <key>WorkingDirectory</key>
-    <string>/Library/Application Support/PSRemotePlayRelay</string>
+    <string>/Library/Application Support/PSBitrateRelay</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11</string>
         <string>-E</string>
         <string>-s</string>
         <string>-B</string>
         <string>-m</string>
-        <string>psrp</string>
+        <string>ps_bitrate_relay</string>
         <string>--config</string>
-        <string>/Library/Application Support/PSRemotePlayRelay/config.json</string>
+        <string>/Library/Application Support/PSBitrateRelay/config.toml</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -31,8 +31,8 @@
     <key>AbandonProcessGroup</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Library/Logs/PSRemotePlayRelay/relay.log</string>
+    <string>/Library/Logs/PSBitrateRelay/relay.log</string>
     <key>StandardErrorPath</key>
-    <string>/Library/Logs/PSRemotePlayRelay/relay.log</string>
+    <string>/Library/Logs/PSBitrateRelay/relay.log</string>
 </dict>
 </plist>

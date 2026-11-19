@@ -1,8 +1,8 @@
 [project]
-name = "ps-remote-play-relay"
+name = "ps-bitrate-relay"
 version = "0.1.0"
 description = "Network-only PS Remote Play bitrate relay for a macOS gateway"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = []
 
 [tool.uv]
