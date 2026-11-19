@@ -34,7 +34,9 @@ class Link:
 
 
 def check_link(interface, mini, ps5):
-    route = command("/sbin/route", "-n", "get", str(ps5)).stdout
+    # Surge can own the default route while Ethernet still reaches PS5 directly.
+    # Validate the configured physical interface, which is also used by BPF/ARP.
+    route = command("/sbin/route", "-n", "get", "-ifscope", interface, str(ps5)).stdout
     if not re.search(r"interface:\s+" + interface + r"\b", route) or re.search(r"flags:.*GATEWAY", route):
         raise RuntimeError(f"ps5.ip: {ps5} must be directly connected on {interface}")
     info = command("/sbin/ifconfig", interface).stdout
